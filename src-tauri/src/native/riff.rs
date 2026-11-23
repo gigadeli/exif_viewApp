@@ -264,9 +264,27 @@ pub fn info_is_utf8(path: &Path) -> bool {
 pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result<bool, String> {
     let mut f = File::open(src).map_err(io)?;
     let lay = parse(&mut f)?;
-    let h = read_header(&mut f, &lay)?;
+    let mut h = read_header(&mut f, &lay)?;
 
-    let mut info = if remove_all { Vec::new() } else { h.old_info.clone() };
+    // ExifTool の CharsetRIFF=Latin は Windows-1252。読み取りと同じく
+    // INFO 全体で判定し、保持する値と新しい値を同じ文字コードにする。
+    let mut original = std::mem::take(&mut h.old_info);
+    if !remove_all && original.iter().any(|(_, v)| std::str::from_utf8(v).is_err()) {
+        const C1: [char; 32] = [
+            '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡',
+            'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
+            '\u{90}', '‘', '’', '“', '”', '•', '–', '—',
+            '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
+        ];
+        for (_, value) in &mut original {
+            let decoded: String = value.iter().map(|&b| match b {
+                0x80..=0x9f => C1[(b - 0x80) as usize],
+                _ => char::from(b),
+            }).collect();
+            *value = decoded.into_bytes();
+        }
+    }
+    let mut info = if remove_all { Vec::new() } else { original.clone() };
     for e in edits {
         match &e.value {
             Some(v) => match info.iter().position(|(id, _)| *id == e.id) {
@@ -280,7 +298,7 @@ pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result
             None => info.retain(|(id, _)| *id != e.id),
         }
     }
-    if info == h.old_info {
+    if info == original {
         return Ok(false);
     }
 
@@ -311,7 +329,6 @@ pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result
     if riff_size > u32::MAX as u64 {
         return Err("ファイルが大きすぎるため、タグを書き込めません".into());
     }
-    let mut h = h;
     let mut ix_positions = Vec::new();
     for c in h.kept.iter_mut() {
         if &c[0..4] == b"LIST" && &c[8..12] == b"hdrl" {
@@ -455,6 +472,24 @@ fn shift_idx1(f: &mut File, idx1: &Chunk, movi: &Chunk, delta: u64) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_info_roundtrips_with_japanese_edit() {
+        let mut body = b"AVI ".to_vec();
+        body.extend(build_info(&[(*b"IART", b"Andr\xe9 \x80".to_vec())], 0));
+        body.extend_from_slice(b"LIST\x04\x00\x00\x00movi");
+        let file = [b"RIFF".as_slice(), &(body.len() as u32).to_le_bytes(), &body].concat();
+        super::super::with_fixture("avi", &file, |path| {
+            let edit = TagChange { group: "RIFF".into(), name: "Title".into(), value: Some("日本語".into()) };
+            let result = super::super::apply(path.to_str().unwrap(), &[edit], false, false).unwrap();
+            assert!(result.updated, "{:?}", result.errors);
+            assert!(info_is_utf8(path));
+            let mut f = File::open(path).unwrap();
+            let layout = parse(&mut f).unwrap();
+            let info = read_header(&mut f, &layout).unwrap().old_info;
+            assert_eq!(info, vec![(*b"IART", "André €".as_bytes().to_vec()), (*b"INAM", "日本語".as_bytes().to_vec())]);
+        });
+    }
 
     #[test]
     fn info_roundtrip() {

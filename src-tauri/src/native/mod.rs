@@ -89,11 +89,10 @@ pub fn apply(path: &str, changes: &[TagChange], backup: bool, preserve_file_time
             result.warnings.extend(unsupported);
             riff::write(src, &staged, &edits, remove_all)
         }
-        Kind::Matroska => {
-            let (edits, unsupported) = matroska::plan(changes);
+        Kind::Matroska => matroska::plan(changes).and_then(|(edits, unsupported)| {
             result.warnings.extend(unsupported);
             matroska::write(src, &staged, &edits, remove_all)
-        }
+        }),
     };
     match outcome {
         Ok(true) => {
@@ -176,6 +175,15 @@ pub(crate) fn copy_range(src: &mut File, dst: &mut impl std::io::Write, start: u
         return Err("ファイルが途中で終わっています".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn with_fixture(ext: &str, data: &[u8], check: impl FnOnce(&Path)) {
+    use std::io::Write;
+    let path = staged_path(&std::env::temp_dir().join(format!("fixture.{ext}"))).unwrap();
+    File::create_new(&path).unwrap().write_all(data).unwrap();
+    check(&path);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[cfg(test)]

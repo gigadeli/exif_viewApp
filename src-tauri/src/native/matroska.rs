@@ -207,11 +207,12 @@ pub fn parse_date(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     let unix = days * 86400 + h * 3600 + mi * 60 + se - offset;
-    Some((unix - 978_307_200) * 1_000_000_000 + nanos)
+    let timestamp = i128::from(unix - 978_307_200) * 1_000_000_000 + i128::from(nanos);
+    i64::try_from(timestamp).ok()
 }
 
 /// タグの変更を Matroska の変更にする。書けないタグは警告の文にして返す
-pub fn plan(changes: &[TagChange]) -> (Vec<Edit>, Vec<String>) {
+pub fn plan(changes: &[TagChange]) -> Result<(Vec<Edit>, Vec<String>), String> {
     let mut edits = Vec::new();
     let mut warn = Vec::new();
     for c in changes {
@@ -228,7 +229,7 @@ pub fn plan(changes: &[TagChange]) -> (Vec<Edit>, Vec<String>) {
             match value.as_deref().map(parse_date) {
                 None => edits.push(Edit::DateUtc(None)),
                 Some(Some(ns)) => edits.push(Edit::DateUtc(Some(ns))),
-                Some(None) => warn.push(format!("Warning: 「{}」は日時として読み取れません", c.value.as_deref().unwrap_or(""))),
+                Some(None) => return Err(format!("「{}」は Matroska の日時として保存できません", c.value.as_deref().unwrap_or(""))),
             }
             continue;
         }
@@ -244,7 +245,7 @@ pub fn plan(changes: &[TagChange]) -> (Vec<Edit>, Vec<String>) {
             None => warn.push(format!("Warning: 「{}:{}」は MKV / WebM に書き込めないタグです", c.group, c.name)),
         }
     }
-    (edits, warn)
+    Ok((edits, warn))
 }
 
 // ---------- 要素の中身の書き換え ----------
@@ -373,7 +374,6 @@ fn edit_tags(body: &[u8], edits: &[(&'static str, Option<String>)], done: &mut V
                     return Ok(tag_rest.to_vec());
                 }
                 let mut t = Vec::new();
-                let mut seen_here: Vec<&str> = Vec::new();
                 for s in children(tag_rest)? {
                     if s.id != SIMPLE_TAG {
                         if s.id != VOID {
@@ -384,16 +384,15 @@ fn edit_tags(body: &[u8], edits: &[(&'static str, Option<String>)], done: &mut V
                     let name = simple_name(s.body)?.unwrap_or_default();
                     match edits.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
                         None => t.extend(s.encode()),
-                        Some((_, None)) => {}
-                        Some((n, Some(v))) => {
-                            // 同じ Tag の中の重複は 1 つにまとめる
-                            if !seen_here.contains(n) {
+                        Some((n, value)) => {
+                            // 編集要求には言語・対象の識別子がない。
+                            if done.contains(n) {
+                                return Err(format!("「{n}」が複数あり、編集対象を特定できません"));
+                            }
+                            if let Some(v) = value {
                                 t.extend(element(SIMPLE_TAG, &replace_simple_value(s.body, v)?));
-                                seen_here.push(n);
                             }
-                            if !done.contains(n) {
-                                done.push(n);
-                            }
+                            done.push(n);
                         }
                     }
                 }
@@ -481,7 +480,7 @@ fn parse(f: &mut File) -> Result<Structure, String> {
     let seg_data = pos + seg.hlen as u64;
     let id_len = seg.hlen - seg.size_len;
     let seg_size_field = seg.size.map(|_| (pos + id_len as u64, seg.size_len));
-    let seg_end = seg.size.map(|s| seg_data + s).unwrap_or(file_len);
+    let mut seg_end = seg.size.map(|s| seg_data + s).unwrap_or(file_len);
     if seg_end > file_len {
         return Err("ファイルが途中で切れています".into());
     }
@@ -494,6 +493,13 @@ fn parse(f: &mut File) -> Result<Structure, String> {
             complete = false;
             break;
         };
+        if matches!(h.id, EBML_HEADER | SEGMENT) {
+            if seg.size.is_some() {
+                return Err("Segment の境界が壊れています".into());
+            }
+            seg_end = p;
+            break;
+        }
         let size = match h.size {
             Some(s) => s,
             None if h.id == CLUSTER => unknown_cluster_end(f, p + h.hlen as u64, seg_end)? - p - h.hlen as u64,
@@ -681,6 +687,9 @@ struct Patch {
 pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result<bool, String> {
     let mut f = File::open(src).map_err(io)?;
     let st = parse(&mut f)?;
+    if remove_all && (!st.complete || st.seg_end != st.file_len) {
+        return Err("ファイル全体のメタデータを確認できないため、すべて削除できません".into());
+    }
     let rel = |off: u64| off - st.seg_data;
     let header_len = st.header_end - st.seg_data;
     if header_len > MAX_HEADER {
@@ -697,14 +706,25 @@ pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result
     }
     let original_items = items.clone();
     let tail: Vec<&L1> = st.els.iter().filter(|e| e.off >= st.header_end).collect();
+    let mut patches = Vec::new();
 
     // --- Info ---
     let info_edits = remove_all || edits.iter().any(|e| !matches!(e, Edit::Simple { .. }));
     if info_edits {
-        match items.iter_mut().find(|i| i.id == INFO) {
-            Some(info) => info.body = edit_info(&info.body, edits, remove_all)?,
-            None if remove_all => {}
-            None => return Err("Info が見つかりません".into()),
+        for info in items.iter_mut().filter(|i| i.id == INFO) {
+            info.body = edit_info(&info.body, edits, remove_all)?;
+        }
+        for el in tail.iter().filter(|e| e.id == INFO) {
+            let old = read_body(&mut f, el)?;
+            let body = edit_info(&old, edits, remove_all)?;
+            if body != old {
+                let bytes = fit(INFO, &body, el.size_len, el.total() as usize)
+                    .ok_or("末尾の Info に変更を書き込む空きがありません")?;
+                patches.push(Patch { off: el.off, bytes });
+            }
+        }
+        if !st.els.iter().any(|el| el.id == INFO) && edits.iter().any(|e| matches!(e, Edit::Title(Some(_)) | Edit::DateUtc(Some(_)))) {
+            return Err("Info が見つかりません".into());
         }
     }
 
@@ -816,13 +836,12 @@ pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result
             tail_changed.push((*el, body.clone()));
         }
     }
-    if !header_changed && tail_changed.is_empty() {
+    if !header_changed && tail_changed.is_empty() && patches.is_empty() {
         return Ok(false);
     }
 
     // --- 末尾の Tags の置き場所 ---
     let can_append = st.complete && st.seg_end == st.file_len;
-    let mut patches: Vec<Patch> = Vec::new();
     let mut map: PosMap = HashMap::new();
     let mut added: Vec<(u32, u64)> = Vec::new();
     // 末尾に追加する要素。truncate_at から書く
@@ -1004,7 +1023,7 @@ pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result
 
     // --- Segment のサイズ ---
     let appended_len: u64 = appended.iter().map(|a| a.1.len() as u64).sum();
-    let new_end = truncate_at + delta + appended_len;
+    let new_end = st.seg_end.min(truncate_at) + delta + appended_len;
     if !appended.is_empty() || truncate_at != st.file_len || delta > 0 {
         if let Some((off, len)) = st.seg_size_field {
             let size = new_end - st.seg_data;
@@ -1178,6 +1197,69 @@ mod tests {
         assert_eq!(parse_date("2001-01-01 00:00:01.5"), Some(1_500_000_000));
         assert_eq!(parse_date("1999:12:31 23:59:59Z"), Some(-(366 * 86_400 + 1) * 1_000_000_000));
         assert_eq!(parse_date("abc"), None);
+        assert_eq!(parse_date("1600:01:01 00:00:00"), None);
+        assert_eq!(parse_date("2500:01:01 00:00:00"), None);
+    }
+
+    fn fixture(elements: &[Vec<u8>]) -> Vec<u8> {
+        let mut file = element(EBML_HEADER, &element(DOCTYPE, b"matroska"));
+        file.extend(element_with(SEGMENT, &elements.concat(), 4));
+        file
+    }
+
+    fn change(path: &Path, group: &str, name: &str, value: Option<&str>) -> crate::write::WriteResult {
+        let edit = TagChange { group: group.into(), name: name.into(), value: value.map(str::to_owned) };
+        super::super::apply(path.to_str().unwrap(), &[edit], false, false).unwrap()
+    }
+
+    #[test]
+    fn growing_header_preserves_next_segment() {
+        let first = fixture(&[element(INFO, &element(TITLE, b"x")), element(CLUSTER, &[])]);
+        let second = fixture(&[element(INFO, &element(TITLE, b"second"))]);
+        let original = [first, second.clone()].concat();
+        super::super::with_fixture("mkv", &original, |path| {
+            assert!(!change(path, "", "all", None).ok);
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            let result = change(path, "Info", "Title", Some("longer title"));
+            assert!(result.updated, "{:?}", result.errors);
+            let mut f = File::open(path).unwrap();
+            let st = parse(&mut f).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            assert!(bytes.len() > original.len());
+            assert_eq!(&bytes[st.seg_end as usize..], second);
+        });
+    }
+
+    #[test]
+    fn remove_all_edits_info_after_cluster() {
+        let retained = element(0x4d80, b"muxer");
+        let info = [element(TITLE, b"private"), element(DATE_UTC, &[0; 8]), retained.clone()].concat();
+        let original = fixture(&[element(CLUSTER, &[]), element(INFO, &info)]);
+        super::super::with_fixture("mkv", &original, |path| {
+            let result = change(path, "", "all", None);
+            assert!(result.updated, "{:?}", result.errors);
+            let mut f = File::open(path).unwrap();
+            let st = parse(&mut f).unwrap();
+            let info = st.els.iter().find(|el| el.id == INFO).unwrap();
+            assert_eq!(read_body(&mut f, info).unwrap(), retained);
+        });
+    }
+
+    #[test]
+    fn ambiguous_translations_and_invalid_dates_preserve_original() {
+        let translated = |language: &[u8], title: &[u8]| element(SIMPLE_TAG, &[
+            element(TAG_NAME, b"TITLE"), element(0x447a, language), element(TAG_STRING, title),
+        ].concat());
+        let tag = new_global_tag(&[translated(b"eng", b"Mountain"), translated(b"jpn", "山".as_bytes())].concat());
+        let original = fixture(&[element(INFO, &[]), element(TAGS, &tag), element(CLUSTER, &[])]);
+        super::super::with_fixture("mkv", &original, |path| {
+            for value in [Some("new title"), None] {
+                assert!(!change(path, "Matroska", "Title", value).ok);
+                assert_eq!(std::fs::read(path).unwrap(), original);
+            }
+            assert!(!change(path, "Info", "DateTimeOriginal", Some("1600:01:01 00:00:00")).ok);
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        });
     }
 
     #[test]
@@ -1186,7 +1268,7 @@ mod tests {
         let tags = with_crc(true, tag);
         let mut done = Vec::new();
         let out = edit_tags(&tags, &[("TITLE", Some("新".into())), ("ARTIST", None)], &mut done).unwrap();
-        assert_eq!(done, vec!["TITLE"]);
+        assert_eq!(done, vec!["TITLE", "ARTIST"]);
         let (crc, rest) = strip_crc(&out);
         assert!(crc);
         assert_eq!(crc32fast::hash(rest).to_le_bytes(), out[2..6]);

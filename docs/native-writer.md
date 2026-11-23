@@ -78,6 +78,7 @@ ExifTool の表示名（グループ `RIFF`）と INFO の ID:
 
 - 日付（ICRD）は `YYYY-MM-DD HH:MM:SS` で書く（ExifTool は `-` を `:` に変えて表示する）。
 - **文字コード**: 値は UTF-8 で書く（ffmpeg など今のツールと同じ）。ExifTool は RIFF の文字列を既定で Latin-1 として読むので、読み取り時に INFO の値がすべて正しい UTF-8 なら `-api CharsetRIFF=UTF8` を付けて読む。正しい UTF-8 でない古いファイルは今までどおり読む。
+- 古い AVI の INFO を変更するときは、既存値を ExifTool の Latin（Windows-1252）と同じ対応表で UTF-8 に変換する。値が変わらない保存では元のバイト列を保持する。
 - `hdrl` 内の `IDIT`（DateTimeOriginal）など、INFO 以外のタグは書き込み対象外（読み取り専用）。
 
 ## 4. MKV / WebM（Matroska）
@@ -113,6 +114,7 @@ Segment <size（不明もあり）>
 - SimpleTag 名は ExifTool の StdTag 表の逆引き（Title→TITLE、DateTimeOriginal→DATE_RECORDED、CreateDate→DATE_DIGITIZED など）。
 - 値を変える場合: 同じ名前の SimpleTag の TagString を置き換える（言語などの属性は残す）。無ければ全体向け Tag に追加し、全体向け Tag が無ければ `Targets`（空 = TargetTypeValue 50）付きで作る。
 - 削除する場合: 全体向け Tag から、その名前の SimpleTag を消す。
+- 言語違いなどで同名の全体向け SimpleTag が複数あるとき、個別の変更・削除は対象を特定できないため保存前にエラーにする。
 - トラックごとのタグ（`Track1:Encoder` など）や EBML ヘッダー、Tracks の内容は書き込み対象外。
 
 ### 4.3 書き込み（通常）
