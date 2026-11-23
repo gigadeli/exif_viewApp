@@ -178,3 +178,51 @@ describe("video fields", () => {
     expect(readDate(zero, none, "video").dt).toBeNull();
   });
 });
+
+describe("AVI / MKV / WebM fields", () => {
+  const avi = file([
+    ["File:FileType", "AVI"],
+    ["File:MIMEType", "video/x-msvideo"],
+    ["RIFF:Title", "AVI のタイトル"],
+    ["RIFF:DateTimeOriginal", "2024:05:01 10:20:30"],
+  ]);
+  const mkv = file([
+    ["File:FileType", "MKV"],
+    ["File:MIMEType", "video/x-matroska"],
+    ["Info:Title", "情報のタイトル"],
+    ["Matroska:Title", "タグのタイトル"],
+    ["Info:DateTimeOriginal", "2024:05:01 01:20:30Z"],
+  ]);
+  const none: FileEdits = {};
+
+  it("detects the kind from FileType", () => {
+    expect(mediaKind(avi)).toBe("avi");
+    expect(mediaKind(mkv)).toBe("matroska");
+    expect(mediaKind(file([["File:FileType", "WEBM"]]))).toBe("matroska");
+  });
+
+  it("reads and writes AVI INFO tags", () => {
+    expect(readTextField(avi, none, "avi", "title")).toBe("AVI のタイトル");
+    const keys = setTextField(avi, none, "avi", "artist", "作者").map((c) => `${c.group}:${c.name}=${c.value}`);
+    expect(keys).toEqual(["RIFF:Artist=作者"]);
+  });
+
+  it("writes the AVI date to DateCreated without a timezone", () => {
+    expect(readDate(avi, none, "avi")).toEqual({ dt: dt("2024:05:01 10:20:30"), tz: "" });
+    const changes = setDate(avi, none, "avi", dt("2025:01:02 03:04:05"), "+09:00");
+    expect(changes).toEqual([{ group: "RIFF", name: "DateCreated", value: "2025:01:02 03:04:05" }]);
+  });
+
+  it("writes the Matroska title to Info and keeps the Title tag in sync", () => {
+    expect(readTextField(mkv, none, "matroska", "title")).toBe("情報のタイトル");
+    const keys = setTextField(mkv, none, "matroska", "title", "新").map((c) => `${c.group}:${c.name}`);
+    expect(keys.sort()).toEqual(["Info:Title", "Matroska:Title"]);
+  });
+
+  it("stores the Matroska date in UTC", () => {
+    const changes = setDate(mkv, none, "matroska", dt("2026:11:01 10:20:30"), "+09:00");
+    expect(changes).toEqual([{ group: "Info", name: "DateTimeOriginal", value: "2026:11:01 01:20:30Z" }]);
+    const read = readDate(mkv, none, "matroska");
+    expect(localToUtc(read.dt!, read.tz)).toEqual(dt("2024:05:01 01:20:30"));
+  });
+});

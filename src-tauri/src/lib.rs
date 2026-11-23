@@ -1,6 +1,7 @@
 mod binary;
 mod commands;
 mod exiftool;
+mod native;
 mod write;
 
 use tauri::Manager;

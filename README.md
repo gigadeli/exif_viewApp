@@ -33,7 +33,7 @@
 | 画像 | JPEG, PNG, TIFF, WebP, HEIC/HEIF, AVIF, GIF | ○ |
 | RAW | DNG, CR2, CR3, NEF, ARW, RAF, ORF, RW2 など | ○ |
 | 動画 | MP4, MOV, M4V, 3GP | ○ |
-| 動画 | AVI, MKV, WebM | 閲覧のみ |
+| 動画 | AVI, MKV, WebM | ○（タイトル・作成者・コメントなど。位置情報は不可） |
 
 ## 注意
 
@@ -83,5 +83,6 @@ cd src-tauri
 $env:EXIF_SAMPLE = "C:\path\to\sample.jpg"          # 読み取りテスト
 $env:EXIF_WRITE_SAMPLE = "C:\path\to\copy.jpg"       # 特殊文字の書き込みテスト（上書きされます）
 $env:EXIF_WRITE_DIR = "C:\path\to\dir"               # 写真.jpg / 動画.mp4 / 動画.mkv のコピーを置いたフォルダ（上書きされます）
+$env:EXIF_NATIVE_DIR = "C:\path\to\samples"         # AVI / MKV / WebM のテスト用動画のフォルダ（読み取るだけ。docs/native-writer.md の 7 章）
 cargo test --lib
 ```

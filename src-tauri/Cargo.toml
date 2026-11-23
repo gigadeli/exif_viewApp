@@ -25,6 +25,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 base64 = "0.22"
+crc32fast = "1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

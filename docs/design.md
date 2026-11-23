@@ -47,7 +47,7 @@ UI は日本語のみ（多言語化はしない。ただし文言は 1 ファ�
 | 画像 | JPEG, PNG, TIFF, WebP, HEIC/HEIF, AVIF | ○ | ○ |
 | RAW | CR2/CR3, NEF, ARW, DNG, RAF など | ○ | ○（DNG/主要 RAW） |
 | 動画 | MP4, MOV, M4V, 3GP | ○ | ○（QuickTime/XMP タグ） |
-| 動画 | AVI, MKV/WebM | ○ | △（ExifTool の書き込み非対応形式あり → UI で読み取り専用表示） |
+| 動画 | AVI, MKV/WebM | ○ | ○（ExifTool は非対応のため自作ライター。[native-writer.md](native-writer.md)） |
 | その他 | GIF, BMP | ○ | △ |
 
 書き込み可否はファイル読み込み時に ExifTool の結果から判定し、不可なら編集 UI を無効化する。
@@ -356,3 +356,12 @@ exif_app/
   画像（JPEG / PNG / GIF / WebP / BMP）はそのまま、UTF-8 の文字列はテキスト、それ以外は 16 進ダンプ（先頭 64KB まで）。
   「ファイルに保存」でタグの中身をそのまま書き出す（Rust 側で ExifTool の `-j -b` の base64 を復号。実装は `src-tauri/src/binary.rs`）。
 - **よく使う項目の非表示**: ツールバーの「よく使う項目を隠す / 表示」とパネル見出しの × で切り替え。状態は次回起動時も引き継ぐ。
+
+### AVI / MKV / WebM の書き込み（2026-11-23）
+- ExifTool はこの 3 形式に書き込めないため、Rust で自作した書き込み処理（`src-tauri/src/native/`）を使う。
+  設計と検証の詳細は [native-writer.md](native-writer.md)。
+- 書き込めるのは AVI の INFO（`RIFF:Title` など 20 種）、Matroska の `Info:Title` / `Info:DateTimeOriginal` と
+  全体向けの SimpleTag（`Matroska:Artist` など）。トラックごとのタグと位置情報は対象外。
+- 映像・音声データは動かさず、ヘッダー部分の空き領域（JUNK / Void）の中で並べ替える。足りなければ、
+  MKV は Tags を末尾へ移す。それでも足りなければ（AVI はすぐに）ヘッダー部分を広げてファイルを書き直し、索引の位置を直す。
+- AVI の INFO は UTF-8 で書く。読み取り時、INFO の値がすべて正しい UTF-8 なら ExifTool に `-api CharsetRIFF=UTF8` を付ける。

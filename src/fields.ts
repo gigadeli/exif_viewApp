@@ -12,7 +12,8 @@ import {
 import { tagKey } from "./editing";
 import type { FileEdits, FileMetadata, TagChange } from "./types";
 
-export type MediaKind = "image" | "video";
+/** image / video は ExifTool で書く形式、avi / matroska は自作ライターで書く形式 (タグの置き場所が違う) */
+export type MediaKind = "image" | "video" | "avi" | "matroska";
 export type TextFieldId = "title" | "description" | "artist" | "copyright" | "keywords";
 
 type TextFieldMap = {
@@ -67,12 +68,43 @@ export const TEXT_FIELDS: Record<MediaKind, Record<TextFieldId, TextFieldMap>> =
     },
     keywords: { read: ["XMP-dc:Subject", "Keys:Keywords"], write: ["XMP-dc:Subject"], ifPresent: ["Keys:Keywords"] },
   },
+  // AVI: RIFF の INFO チャンク
+  avi: {
+    title: { read: ["RIFF:Title"], write: ["RIFF:Title"], ifPresent: [] },
+    description: { read: ["RIFF:Comment", "RIFF:Subject"], write: ["RIFF:Comment"], ifPresent: [] },
+    artist: { read: ["RIFF:Artist"], write: ["RIFF:Artist"], ifPresent: [] },
+    copyright: { read: ["RIFF:Copyright"], write: ["RIFF:Copyright"], ifPresent: [] },
+    keywords: { read: ["RIFF:Keywords"], write: ["RIFF:Keywords"], ifPresent: [] },
+  },
+  // MKV / WebM: タイトルは Segment の Info、他は全体向けの SimpleTag
+  matroska: {
+    title: { read: ["Info:Title", "Matroska:Title"], write: ["Info:Title"], ifPresent: ["Matroska:Title"] },
+    description: {
+      read: ["Matroska:Description", "Matroska:Comment"],
+      write: ["Matroska:Description"],
+      ifPresent: [],
+    },
+    artist: { read: ["Matroska:Artist"], write: ["Matroska:Artist"], ifPresent: [] },
+    copyright: { read: ["Matroska:Copyright"], write: ["Matroska:Copyright"], ifPresent: [] },
+    keywords: { read: ["Matroska:Keywords"], write: ["Matroska:Keywords"], ifPresent: [] },
+  },
 };
 
+const MATROSKA_TYPES = new Set(["MKV", "MKA", "MKS", "WEBM"]);
+
 export function mediaKind(file: FileMetadata): MediaKind {
+  const type = file.tags.find((t) => t.group === "File" && t.name === "FileType")?.value ?? "";
+  if (type === "AVI") return "avi";
+  if (MATROSKA_TYPES.has(type)) return "matroska";
   const mime = file.tags.find((t) => t.name === "MIMEType")?.value ?? "";
   return mime.startsWith("video/") ? "video" : "image";
 }
+
+/** 位置情報を書き込める種類か (AVI / MKV / WebM は対応していない) */
+export const supportsGps = (kind: MediaKind) => kind === "image" || kind === "video";
+
+/** タイムゾーンを保存できない種類 (AVI の日時はローカル時刻の文字列だけ) */
+export const dateHasTz = (kind: MediaKind) => kind !== "avi";
 
 const splitKey = (key: string) => {
   const i = key.indexOf(":");
@@ -137,7 +169,34 @@ const IMAGE_TZ_TAGS = ["ExifIFD:OffsetTimeOriginal", "ExifIFD:OffsetTimeDigitize
 /** 動画のトラックごとの日時 (Track1, Track2 … のどのグループにもある) */
 const VIDEO_TRACK_DATE_NAMES = ["TrackCreateDate", "MediaCreateDate"];
 
+const AVI_DATE_READ = ["RIFF:DateCreated", "RIFF:DateTimeOriginal"];
+const MKV_DATE = "Info:DateTimeOriginal";
+const MKV_DATE_TAG = "Matroska:DateTimeOriginal";
+
+/** UTC の日時文字列を、PC のタイムゾーンでの表示にする */
+function utcField(v: string | undefined): DateField | null {
+  const pu = v && parseExifDate(v);
+  if (!pu) return null;
+  const tz = pcTzAt(pu.dt);
+  return { dt: utcToLocal(pu.dt, tz), tz };
+}
+
 export function readDate(file: FileMetadata, edits: FileEdits, kind: MediaKind): DateField {
+  if (kind === "avi") {
+    for (const key of AVI_DATE_READ) {
+      const p = parseExifDate(effectiveValue(file, edits, key) ?? "");
+      if (p) return { dt: p.dt, tz: "" };
+    }
+    return { dt: null, tz: "" };
+  }
+  if (kind === "matroska") {
+    const fromInfo = utcField(effectiveValue(file, edits, MKV_DATE));
+    if (fromInfo) return fromInfo;
+    // SimpleTag の DATE_RECORDED (タイムゾーンが書かれていれば、それを使う)
+    const p = parseExifDate(effectiveValue(file, edits, MKV_DATE_TAG) ?? "");
+    if (p) return p.tz ? { dt: p.dt, tz: p.tz } : (utcField(effectiveValue(file, edits, MKV_DATE_TAG)) as DateField);
+    return { dt: null, tz: pcTzAt(null) };
+  }
   if (kind === "image") {
     for (const key of IMAGE_DATE_READ) {
       const v = effectiveValue(file, edits, key);
@@ -164,6 +223,8 @@ export function readDate(file: FileMetadata, edits: FileEdits, kind: MediaKind):
 
 export function dateFieldKeys(file: FileMetadata, kind: MediaKind): string[] {
   if (kind === "image") return [...IMAGE_DATE_READ, ...IMAGE_TZ_TAGS];
+  if (kind === "avi") return AVI_DATE_READ;
+  if (kind === "matroska") return [MKV_DATE, MKV_DATE_TAG];
   const trackKeys = file.tags.filter((t) => VIDEO_TRACK_DATE_NAMES.includes(t.name)).map(tagKey);
   return ["QuickTime:CreateDate", "Keys:CreationDate", ...trackKeys];
 }
@@ -181,6 +242,18 @@ export function setDate(
     if (value === null && !isPresent(file, edits, key)) return;
     changes.push({ ...splitKey(key), value });
   };
+
+  if (kind === "avi") {
+    // DateTimeOriginal (hdrl の IDIT) は書き込めないので、INFO の DateCreated に書く
+    set("RIFF:DateCreated", dt && formatExifDate(dt));
+    return changes;
+  }
+  if (kind === "matroska") {
+    const utc = dt && formatExifDate(localToUtc(dt, tz || "+00:00"));
+    set(MKV_DATE, utc && `${utc}Z`);
+    if (isPresent(file, edits, MKV_DATE_TAG)) set(MKV_DATE_TAG, utc);
+    return changes;
+  }
 
   if (kind === "image") {
     const local = dt && formatExifDate(dt);

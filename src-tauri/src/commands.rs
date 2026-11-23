@@ -93,7 +93,13 @@ fn read_one(et: &mut ExifTool, path: &str) -> FileMetadata {
     };
 
     // -G1: 詳細なグループ名 / -a: 重複タグも出す / -s: タグ名で出力 / -j: JSON
-    let result = et.execute(&["-j", "-G1", "-a", "-s", "-api", "LargeFileSupport=1", path]);
+    let mut args = vec!["-j", "-G1", "-a", "-s", "-api", "LargeFileSupport=1"];
+    // AVI の INFO は既定では Latin-1 として読まれる。値が UTF-8 なら UTF-8 として読む
+    if crate::native::avi_info_is_utf8(Path::new(path)) {
+        args.extend(["-api", "CharsetRIFF=UTF8"]);
+    }
+    args.push(path);
+    let result = et.execute(&args);
     match result {
         Ok((out, err)) => {
             meta.warnings = err.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();

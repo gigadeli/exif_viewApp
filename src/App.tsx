@@ -22,7 +22,7 @@ import { QuickEdit } from "./components/QuickEdit";
 import { SaveDialog, SaveResultDialog } from "./components/SaveDialog";
 import { TagTable } from "./components/TagTable";
 import { changeList, fileExt, hasEdits, isFileWritable, isRemoveAll, REMOVE_ALL, tagKey, unconfirmedChanges } from "./editing";
-import { mediaKind } from "./fields";
+import { mediaKind, supportsGps } from "./fields";
 import { readGps, setGps } from "./gps";
 import { MEDIA_EXTENSIONS, S } from "./strings";
 import type {
@@ -402,7 +402,7 @@ export default function App() {
                 <MapView
                   key={`map:${current.path}`}
                   point={readGps(current, currentEdits, mediaKind(current))}
-                  editable={isFileWritable(current, writable)}
+                  editable={isFileWritable(current, writable) && supportsGps(mediaKind(current))}
                   onPick={(lat, lon) => {
                     const kind = mediaKind(current);
                     const alt = readGps(current, currentEdits, kind)?.alt ?? null;

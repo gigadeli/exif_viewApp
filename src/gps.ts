@@ -1,7 +1,7 @@
 // 位置情報 (GPS) の読み書き。
 // - 画像: GPS IFD の GPSLatitude / GPSLatitudeRef など (値は絶対値 + 方角)。XMP-exif の GPS は、あれば揃える。
 // - 動画: Keys:GPSCoordinates (Apple) と UserData:GPSCoordinates (©xyz) に "緯度, 経度, 高度"。
-import { effectiveValue, type MediaKind } from "./fields";
+import { effectiveValue, supportsGps, type MediaKind } from "./fields";
 import { tagKey } from "./editing";
 import type { FileEdits, FileMetadata, TagChange } from "./types";
 
@@ -50,6 +50,7 @@ const IMAGE_GPS = {
 const VIDEO_GPS = ["Keys:GPSCoordinates", "UserData:GPSCoordinates"];
 
 export function readGps(file: FileMetadata, edits: FileEdits, kind: MediaKind): GpsPoint | null {
+  if (!supportsGps(kind)) return null;
   const v = (k: string) => effectiveValue(file, edits, k);
   if (kind === "image") {
     const lat = v(IMAGE_GPS.lat);
@@ -84,6 +85,7 @@ export function readGps(file: FileMetadata, edits: FileEdits, kind: MediaKind): 
 
 /** 位置情報に関係するタグ (変更ありの判定・元に戻す・削除用) */
 export function gpsKeys(file: FileMetadata, kind: MediaKind, edits: FileEdits = {}): string[] {
+  if (!supportsGps(kind)) return [];
   const existing = [...file.tags, ...Object.values(edits)]
     .filter((t) => t.group !== "Composite" && (t.group === "GPS" || /^GPS/.test(t.name)))
     .map(tagKey);
@@ -104,6 +106,7 @@ export function setGps(
   kind: MediaKind,
   p: GpsPoint | null,
 ): TagChange[] {
+  if (!supportsGps(kind)) return [];
   const present = (k: string) => file.tags.some((t) => tagKey(t) === k) || (k in edits && edits[k].value !== null);
   const change = (key: string, value: string | null): TagChange => {
     const i = key.indexOf(":");

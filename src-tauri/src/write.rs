@@ -48,6 +48,8 @@ pub struct WritableInfo {
     pub tags: Vec<String>,
     /// 書き込み可能な拡張子 (小文字)
     pub extensions: Vec<String>,
+    /// ExifTool の代わりに自作ライターで書ける形式とタグ (AVI, MKV, WebM)
+    pub native: crate::native::NativeWritable,
 }
 
 /// "-listw" などの出力 ("見出し:\n  A B C\n  D E") から単語を取り出す
@@ -68,6 +70,7 @@ pub async fn writable_info(
             Ok(WritableInfo {
                 tags: parse_list(&tags),
                 extensions: parse_list(&exts).into_iter().map(|e| e.to_lowercase()).collect(),
+                native: crate::native::writable(),
             })
         })
     })
@@ -107,6 +110,10 @@ fn apply(
     backup: bool,
     preserve_file_time: bool,
 ) -> Result<WriteResult, String> {
+    // AVI / MKV / WebM は ExifTool が書き込めないので自作ライターで書く
+    if crate::native::detect(Path::new(path)).is_some() {
+        return crate::native::apply(path, changes, backup, preserve_file_time);
+    }
     // -sep: キーワードなどリスト型のタグは ", " 区切りで複数の値として書く (読み取り側の表示と同じ形式)
     let mut args: Vec<String> =
         vec!["-api".into(), "LargeFileSupport=1".into(), "-sep".into(), ", ".into()];
@@ -397,10 +404,10 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert_eq!(read(&mut et, &mp4, "-UserData:GPSCoordinates"), None);
 
-        // 5. MKV は書き込み非対応 → エラー
-        let r = apply(&mut et, &mkv, &[change("", "Title", Some("x"))], false, false).unwrap();
-        assert!(!r.ok && !r.errors.is_empty());
-        println!("mkv errors: {:?}", r.errors);
+        // 5. MKV は自作ライターで書ける
+        let r = apply(&mut et, &mkv, &[change("Info", "Title", Some("x"))], false, false).unwrap();
+        assert!(r.ok && r.updated, "{:?}", r.errors);
+        assert_eq!(read(&mut et, &mkv, "-Info:Title").as_deref(), Some("x"));
 
         drop(et);
         let _ = std::fs::remove_dir_all(&base);

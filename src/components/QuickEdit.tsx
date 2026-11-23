@@ -3,6 +3,7 @@ import { fromInputValue, toInputValue, TZ_OPTIONS, type TzOffset } from "../date
 import { isFileWritable } from "../editing";
 import {
   dateFieldKeys,
+  dateHasTz,
   findByName,
   INFO_TAGS,
   mediaKind,
@@ -10,6 +11,7 @@ import {
   readTextField,
   setDate,
   setTextField,
+  supportsGps,
   textFieldKeys,
   type TextFieldId,
 } from "../fields";
@@ -53,6 +55,8 @@ export function QuickEdit({ file, edits, writable, onApply, onRevertKeys, onShow
   const gpsFieldKeys = gpsKeys(file, kind, edits);
   const gpsRemovals = setGps(file, edits, kind, null);
   const gps = readGps(file, edits, kind);
+  const gpsDisabled = disabled || !supportsGps(kind);
+  const dateNote = kind === "image" ? S.fDateImageNote : kind === "avi" ? S.fDateAviNote : S.fDateVideoNote;
 
   return (
     <div className="quick">
@@ -68,10 +72,11 @@ export function QuickEdit({ file, edits, writable, onApply, onRevertKeys, onShow
         <DateInput
           value={readDate(file, edits, kind)}
           allowNoTz={kind === "image"}
+          showTz={dateHasTz(kind)}
           disabled={disabled}
           onCommit={(dt, tz) => onApply(setDate(file, edits, kind, dt, tz))}
         />
-        <small className="muted">{kind === "video" ? S.fDateVideoNote : S.fDateImageNote}</small>
+        <small className="muted">{dateNote}</small>
       </Field>
 
       {textRow("title", S.fTitle)}
@@ -90,14 +95,15 @@ export function QuickEdit({ file, edits, writable, onApply, onRevertKeys, onShow
       <Field label={S.fGps} changed={changed(gpsFieldKeys)} onRevert={() => onRevertKeys(gpsFieldKeys)}>
         <GpsInput
           value={gps}
-          disabled={disabled}
+          disabled={gpsDisabled}
           onCommit={(p) => onApply(setGps(file, edits, kind, p))}
         />
+        {!supportsGps(kind) && <small className="muted">{S.fGpsUnsupported}</small>}
         <div className="gps-actions">
-          <button className="small" onClick={onShowMap}>
+          <button className="small" onClick={onShowMap} disabled={!supportsGps(kind)}>
             {S.fGpsShowMap}
           </button>
-          <button className="small" disabled={disabled || !gpsRemovals.length} onClick={() => onApply(gpsRemovals)}>
+          <button className="small" disabled={gpsDisabled || !gpsRemovals.length} onClick={() => onApply(gpsRemovals)}>
             {S.fGpsRemove}
           </button>
         </div>
@@ -190,11 +196,13 @@ function TextInput({
 function DateInput({
   value,
   allowNoTz,
+  showTz,
   disabled,
   onCommit,
 }: {
   value: ReturnType<typeof readDate>;
   allowNoTz: boolean;
+  showTz: boolean;
   disabled: boolean;
   onCommit: (dt: ReturnType<typeof fromInputValue>, tz: TzOffset) => void;
 }) {
@@ -210,7 +218,7 @@ function DateInput({
 
   const tzOptions = TZ_OPTIONS.includes(value.tz) || !value.tz ? TZ_OPTIONS : [value.tz, ...TZ_OPTIONS];
   return (
-    <div className="date-row">
+    <div className={showTz ? "date-row" : "date-row no-tz"}>
       <input
         type="datetime-local"
         step={1}
@@ -221,19 +229,21 @@ function DateInput({
         onBlur={commitDate}
         onKeyDown={(e) => e.key === "Enter" && commitDate()}
       />
-      <select
-        aria-label={S.fTz}
-        value={value.tz}
-        disabled={disabled || !value.dt}
-        onChange={(e) => value.dt && onCommit(value.dt, e.target.value)}
-      >
-        {allowNoTz && <option value="">{S.fTzNone}</option>}
-        {tzOptions.map((tz) => (
-          <option key={tz} value={tz}>
-            UTC{tz}
-          </option>
-        ))}
-      </select>
+      {showTz && (
+        <select
+          aria-label={S.fTz}
+          value={value.tz}
+          disabled={disabled || !value.dt}
+          onChange={(e) => value.dt && onCommit(value.dt, e.target.value)}
+        >
+          {allowNoTz && <option value="">{S.fTzNone}</option>}
+          {tzOptions.map((tz) => (
+            <option key={tz} value={tz}>
+              UTC{tz}
+            </option>
+          ))}
+        </select>
+      )}
       <button
         className="icon-btn visible"
         title={S.fClearDate}

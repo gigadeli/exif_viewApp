@@ -20,8 +20,19 @@ export const exportMetadata = (paths: string[], format: ExportFormat, dest: stri
   invoke<void>("export_metadata", { paths, format, dest });
 
 export const writableInfo = async (): Promise<WritableInfo> => {
-  const r = await invoke<{ tags: string[]; extensions: string[] }>("writable_info");
-  return { tags: new Set(r.tags), extensions: new Set(r.extensions) };
+  const r = await invoke<{
+    tags: string[];
+    extensions: string[];
+    native: { fileTypes: string[]; tags: Record<string, string[]> };
+  }>("writable_info");
+  return {
+    tags: new Set(r.tags),
+    extensions: new Set(r.extensions),
+    native: {
+      fileTypes: new Set(r.native.fileTypes),
+      tags: new Map(Object.entries(r.native.tags).map(([g, names]) => [g, new Set(names)])),
+    },
+  };
 };
 
 export const writeMetadata = (path: string, changes: TagChange[], options: WriteOptions) =>

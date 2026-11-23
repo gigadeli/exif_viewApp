@@ -1,5 +1,16 @@
 import { useMemo, useRef, useState } from "react";
-import { COMMON_NEW_TAGS, isBinary, isFileWritable, isRemoveAll, isTagEditable, parseTagInput, tagKey } from "../editing";
+import {
+  canWriteTag,
+  COMMON_NEW_TAGS,
+  isBinary,
+  isFileWritable,
+  isNativeFormat,
+  isRemoveAll,
+  isTagEditable,
+  nativeTagSuggestions,
+  parseTagInput,
+  tagKey,
+} from "../editing";
 import type { FileEdits, FileMetadata, Tag, TagChange, WritableInfo } from "../types";
 import { S } from "../strings";
 
@@ -230,21 +241,35 @@ export function TagTable({ file, edits, writable, onChange, onRevert, onShowBina
         </table>
       </div>
 
-      {fileWritable && <AddTagForm writable={writable} onAdd={onChange} />}
+      {fileWritable && <AddTagForm file={file} writable={writable} onAdd={onChange} />}
     </div>
   );
 }
 
-function AddTagForm({ writable, onAdd }: { writable: WritableInfo | null; onAdd: (c: TagChange) => void }) {
+function AddTagForm({
+  file,
+  writable,
+  onAdd,
+}: {
+  file: FileMetadata;
+  writable: WritableInfo | null;
+  onAdd: (c: TagChange) => void;
+}) {
+  const suggestions = isNativeFormat(file, writable) ? nativeTagSuggestions(file, writable) : COMMON_NEW_TAGS;
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    const parsed = parseTagInput(name);
+    let parsed = parseTagInput(name);
     if (!parsed) return setError(S.addTagInvalid);
-    if (writable && !writable.tags.has(parsed.name)) return setError(S.addTagNotWritable(parsed.name));
+    if (!parsed.group && isNativeFormat(file, writable)) {
+      // AVI / MKV / WebM はグループ省略時に、そのタグ名を書けるグループを補う
+      const key = nativeTagSuggestions(file, writable).find((k) => k.split(":")[1].toLowerCase() === parsed!.name.toLowerCase());
+      if (key) parsed = { group: key.split(":")[0], name: key.split(":")[1] };
+    }
+    if (!canWriteTag(file, writable, parsed.group, parsed.name)) return setError(S.addTagNotWritable(parsed.name));
     onAdd({ ...parsed, value });
     setName("");
     setValue("");
@@ -261,7 +286,7 @@ function AddTagForm({ writable, onAdd }: { writable: WritableInfo | null; onAdd:
         onChange={(e) => setName(e.target.value)}
       />
       <datalist id="common-tags">
-        {COMMON_NEW_TAGS.map((t) => (
+        {suggestions.map((t) => (
           <option key={t} value={t} />
         ))}
       </datalist>

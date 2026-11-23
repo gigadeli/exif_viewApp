@@ -14,15 +14,30 @@ export const isBinary = (tag: Tag) => /^\(Binary data \d+ bytes/.test(tag.value)
 
 export const fileExt = (name: string) => name.split(".").pop()?.toLowerCase() ?? "";
 
-/** ExifTool がこの形式に書き込めるか (MKV, AVI などは読み取り専用) */
+/** ExifTool の File:FileType ("JPEG", "AVI", "MKV" など) */
+export const fileType = (file: FileMetadata) =>
+  file.tags.find((t) => t.group === "File" && t.name === "FileType")?.value ?? "";
+
+/** ExifTool の代わりに自作ライターで書く形式 (AVI, MKV, WebM) か */
+export const isNativeFormat = (file: FileMetadata, info: WritableInfo | null) =>
+  !!info && info.native.fileTypes.has(fileType(file));
+
+/** この形式に書き込めるか (ExifTool か自作ライターのどちらか) */
 export const isFileWritable = (file: FileMetadata, info: WritableInfo | null) =>
-  !!info && !file.error && info.extensions.has(fileExt(file.fileName));
+  !!info && !file.error && (info.extensions.has(fileExt(file.fileName)) || isNativeFormat(file, info));
+
+/** グループ・タグ名の組み合わせに書き込めるか。グループ省略時は自作ライターの形式では書けない */
+export function canWriteTag(file: FileMetadata, info: WritableInfo | null, group: string, name: string) {
+  if (!info) return true;
+  if (isNativeFormat(file, info)) return !!info.native.tags.get(group)?.has(name);
+  return info.tags.has(name);
+}
 
 export function isTagEditable(file: FileMetadata, tag: Tag, info: WritableInfo | null) {
   if (!info || !isFileWritable(file, info)) return false;
   if (READ_ONLY_GROUPS.has(tag.group)) return false;
   if (isBinary(tag)) return false;
-  return info.tags.has(tag.name);
+  return canWriteTag(file, info, tag.group, tag.name);
 }
 
 /** "XMP-dc:Title" や "Artist" を { group, name } に分ける */
@@ -52,6 +67,13 @@ export function unconfirmedChanges(changes: TagChange[], file: FileMetadata): Fi
     if (retryAll || !applied) pending[tagKey(change)] = change;
   }
   return pending;
+}
+
+/** 自作ライターの形式で、追加するタグの入力候補 */
+export function nativeTagSuggestions(file: FileMetadata, info: WritableInfo | null): string[] {
+  if (!info || !isNativeFormat(file, info)) return [];
+  const groups = fileType(file) === "AVI" ? ["RIFF"] : ["Info", "Matroska"];
+  return groups.flatMap((g) => [...(info.native.tags.get(g) ?? [])].map((n) => `${g}:${n}`));
 }
 
 /** 追加するタグとして入力候補に出す、よく使うタグ */

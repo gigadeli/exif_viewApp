@@ -33,4 +33,11 @@ export type WriteResult = {
   warnings: string[];
 };
 
-export type WritableInfo = { tags: Set<string>; extensions: Set<string> };
+export type WritableInfo = {
+  /** ExifTool が書き込めるタグ名 */
+  tags: Set<string>;
+  /** ExifTool が書き込める拡張子 (小文字) */
+  extensions: Set<string>;
+  /** 自作ライターで書ける形式 (AVI, MKV, WebM)。fileTypes は File:FileType の値、tags はグループ → タグ名 */
+  native: { fileTypes: Set<string>; tags: Map<string, Set<string>> };
+};
