@@ -96,6 +96,7 @@ export const S = {
   fKeywords: "キーワード",
   fKeywordsPlaceholder: "入力して Enter",
   fClearDate: "日時を消す",
+  fClearDateReadOnly: "この日時（AVI の IDIT）は書き換えられないため消せません。入力した日時は作成日時（DateCreated）に保存されます",
   fDateVideoNote: "動画の日時は UTC に変換して保存されます",
   fDateImageNote: "タイムゾーンを選ぶと OffsetTime タグにも記録します",
   fDateAviNote: "AVI の日時はタイムゾーンなしで保存されます",

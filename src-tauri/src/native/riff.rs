@@ -260,28 +260,88 @@ pub fn info_is_utf8(path: &Path) -> bool {
     values().any(|v| !v.is_ascii()) && values().all(|v| std::str::from_utf8(v).is_ok())
 }
 
+/// INFO に UTF-8 として読めない値がある (古いソフトがシステムの文字コードで書いた) か
+fn is_legacy(info: &[([u8; 4], Vec<u8>)]) -> bool {
+    info.iter().any(|(_, v)| std::str::from_utf8(v).is_err())
+}
+
+/// 古い INFO の値を文字列にする。PC の ANSI コードページ (日本語の Windows なら CP932) で読めればそれを使い、
+/// 読めなければ ExifTool の既定と同じ Windows-1252 で読む
+pub fn decode_legacy(b: &[u8]) -> String {
+    #[cfg(windows)]
+    if let Some(s) = decode_ansi(b) {
+        return s;
+    }
+    decode_cp1252(b)
+}
+
+fn decode_cp1252(b: &[u8]) -> String {
+    const C1: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
+        '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
+    ];
+    b.iter()
+        .map(|&b| match b {
+            0x80..=0x9f => C1[(b - 0x80) as usize],
+            _ => char::from(b),
+        })
+        .collect()
+}
+
+/// ANSI コードページで厳密に読む (不正なバイト列なら None)
+#[cfg(windows)]
+fn decode_ansi(b: &[u8]) -> Option<String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MultiByteToWideChar(code_page: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
+    }
+    const CP_ACP: u32 = 0;
+    const MB_ERR_INVALID_CHARS: u32 = 0x8;
+    if b.is_empty() {
+        return Some(String::new());
+    }
+    let len = i32::try_from(b.len()).ok()?;
+    // SAFETY: 長さを渡した入力バッファと、必要な長さを確保した出力バッファだけを使う
+    let n = unsafe { MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, b.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return None;
+    }
+    let mut w = vec![0u16; n as usize];
+    let n = unsafe { MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, b.as_ptr(), len, w.as_mut_ptr(), n) };
+    if n <= 0 {
+        return None;
+    }
+    String::from_utf16(&w[..n as usize]).ok()
+}
+
+/// 画面表示用: INFO が古い文字コードのとき、ASCII 以外を含む値を (ExifTool のタグ名, 文字列) で返す。
+/// ExifTool は RIFF の文字列を Windows-1252 でしか読めないので、日本語などはこちらで読み直す
+pub fn legacy_values(path: &Path) -> Vec<(&'static str, String)> {
+    let Ok(mut f) = File::open(path) else { return Vec::new() };
+    let Ok(lay) = parse(&mut f) else { return Vec::new() };
+    let Ok(h) = read_header(&mut f, &lay) else { return Vec::new() };
+    if !is_legacy(&h.old_info) {
+        return Vec::new();
+    }
+    h.old_info
+        .iter()
+        .filter(|(_, v)| !v.is_ascii())
+        .filter_map(|(id, v)| INFO_TAGS.iter().find(|(_, i)| *i == id).map(|(n, _)| (*n, decode_legacy(v))))
+        .collect()
+}
+
 /// 書き込み。変更が無ければ Ok(false) で、dst は作らない
 pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result<bool, String> {
     let mut f = File::open(src).map_err(io)?;
     let lay = parse(&mut f)?;
     let mut h = read_header(&mut f, &lay)?;
 
-    // ExifTool の CharsetRIFF=Latin は Windows-1252。読み取りと同じく
-    // INFO 全体で判定し、保持する値と新しい値を同じ文字コードにする。
+    // 新しい値は UTF-8 で書くので、UTF-8 でない古い INFO は保持する値も UTF-8 に直す。
+    // 画面の表示 (legacy_values) と同じ読み方にして、見えていた文字のまま保存する。
     let mut original = std::mem::take(&mut h.old_info);
-    if !remove_all && original.iter().any(|(_, v)| std::str::from_utf8(v).is_err()) {
-        const C1: [char; 32] = [
-            '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡',
-            'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
-            '\u{90}', '‘', '’', '“', '”', '•', '–', '—',
-            '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-        ];
+    if !remove_all && is_legacy(&original) {
         for (_, value) in &mut original {
-            let decoded: String = value.iter().map(|&b| match b {
-                0x80..=0x9f => C1[(b - 0x80) as usize],
-                _ => char::from(b),
-            }).collect();
-            *value = decoded.into_bytes();
+            *value = decode_legacy(value).into_bytes();
         }
     }
     let mut info = if remove_all { Vec::new() } else { original.clone() };
@@ -488,6 +548,38 @@ mod tests {
             let layout = parse(&mut f).unwrap();
             let info = read_header(&mut f, &layout).unwrap().old_info;
             assert_eq!(info, vec![(*b"IART", "André €".as_bytes().to_vec()), (*b"INAM", "日本語".as_bytes().to_vec())]);
+        });
+    }
+
+    /// 日本語の Windows (ANSI コードページ 932) では、古い AVI の CP932 の値を正しく読み、保存後も同じ文字のまま残る
+    #[cfg(windows)]
+    #[test]
+    fn legacy_cp932_is_kept_readable() {
+        unsafe extern "system" {
+            fn GetACP() -> u32;
+        }
+        if unsafe { GetACP() } != 932 {
+            return;
+        }
+        let title = [0x93, 0xfa, 0x96, 0x7b, 0x82, 0xcc, 0x93, 0xae, 0x89, 0xe6]; // 「日本の動画」(CP932)
+        assert_eq!(decode_legacy(&title), "日本の動画");
+        let mut body = b"AVI ".to_vec();
+        body.extend(build_info(&[(*b"INAM", title.to_vec())], 0));
+        body.extend_from_slice(b"JUNK\x40\x00\x00\x00");
+        body.extend_from_slice(&[0; 0x40]);
+        body.extend_from_slice(b"LIST\x04\x00\x00\x00movi");
+        let file = [b"RIFF".as_slice(), &(body.len() as u32).to_le_bytes(), &body].concat();
+        super::super::with_fixture("avi", &file, |path| {
+            assert_eq!(legacy_values(path), vec![("Title", "日本の動画".to_string())]);
+            let edit = TagChange { group: "RIFF".into(), name: "Artist".into(), value: Some("作者".into()) };
+            let result = super::super::apply(path.to_str().unwrap(), &[edit], false, false).unwrap();
+            assert!(result.updated, "{:?}", result.errors);
+            assert!(info_is_utf8(path));
+            assert!(legacy_values(path).is_empty());
+            let mut f = File::open(path).unwrap();
+            let layout = parse(&mut f).unwrap();
+            let info = read_header(&mut f, &layout).unwrap().old_info;
+            assert_eq!(info, vec![(*b"INAM", "日本の動画".as_bytes().to_vec()), (*b"IART", "作者".as_bytes().to_vec())]);
         });
     }
 

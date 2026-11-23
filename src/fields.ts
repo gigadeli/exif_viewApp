@@ -170,6 +170,16 @@ const IMAGE_TZ_TAGS = ["ExifIFD:OffsetTimeOriginal", "ExifIFD:OffsetTimeDigitize
 const VIDEO_TRACK_DATE_NAMES = ["TrackCreateDate", "MediaCreateDate"];
 
 const AVI_DATE_READ = ["RIFF:DateCreated", "RIFF:DateTimeOriginal"];
+
+/**
+ * 表示中の日時を消せるか。AVI の DateTimeOriginal (hdrl の IDIT) は書き込めないので、
+ * それしか無い場合は消せない (消しても表示が変わらない)
+ */
+export function dateClearable(file: FileMetadata, edits: FileEdits, kind: MediaKind): boolean {
+  if (!readDate(file, edits, kind).dt) return false;
+  if (kind !== "avi") return true;
+  return !!parseExifDate(effectiveValue(file, edits, "RIFF:DateCreated") ?? "");
+}
 const MKV_DATE = "Info:DateTimeOriginal";
 const MKV_DATE_TAG = "Matroska:DateTimeOriginal";
 

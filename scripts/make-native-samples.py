@@ -103,3 +103,23 @@ if b[p] == 0xBF:
     b[p:p + 6] = void(6); print('seekhead crc removed')
 b[seg - ssl:seg] = size_bytes(len(b) - seg, ssl)
 open('tailtags.mkv', 'wb').write(b)
+
+# 4. SeekHead はあるが Tags の項目が無い (Tags を末尾へ移したとき SeekHead に足す必要がある)
+b = bytearray(open('plain.mkv', 'rb').read())
+segp, seg, ssl, els = elements(b)
+sh = [e for e in els if e['id'] == 0x114D9B74][0]
+q = sh['off'] + sh['hl']
+while q < sh['end']:
+    ci, cl = vint(b, q, True); cs, csl = vint(b, q + cl); cb = q + cl + csl
+    if ci == 0xBF:  # 中身を変えるので CRC は外す
+        b[q:cb + cs] = void(cb + cs - q)
+    if ci == 0x4DBB:
+        r = cb; sid = None
+        while r < cb + cs:
+            ri, rl = vint(b, r, True); rs, rsl = vint(b, r + rl); rb = r + rl + rsl
+            if ri == 0x53AB: sid = bytes(b[rb:rb + rs])
+            r = rb + rs
+        if sid == bytes.fromhex('1254C367'):
+            b[q:cb + cs] = void(cb + cs - q)
+    q = cb + cs
+open('seek_no_tags.mkv', 'wb').write(b)

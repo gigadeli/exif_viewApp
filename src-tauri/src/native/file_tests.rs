@@ -1,6 +1,6 @@
 //! 実ファイルでの書き込みテスト。EXIF_NATIVE_DIR にテスト用の動画があるときだけ実行する。
 //! 必要なファイル: plain.avi, noinfo.avi, plain.mkv, plain.webm, stream.webm, stream.mkv,
-//! unknown_cluster.webm, noseek.mkv, tailtags.mkv (作り方は docs/native-writer.md の 7 章)
+//! unknown_cluster.webm, noseek.mkv, tailtags.mkv, seek_no_tags.mkv (作り方は docs/native-writer.md の 7 章)
 //! ffmpeg が PATH にあれば、映像・音声データが変わっていないことも確かめる。
 
 use std::path::{Path, PathBuf};
@@ -250,7 +250,7 @@ fn native_write_scenarios() {
     check_media(&src("plain.mkv"), &mkv);
 
     // I. WebM、サイズ不明の Segment / Cluster、SeekHead なし、Tags が末尾
-    for name in ["plain.webm", "stream.webm", "stream.mkv", "unknown_cluster.webm", "noseek.mkv", "tailtags.mkv"] {
+    for name in ["plain.webm", "stream.webm", "stream.mkv", "unknown_cluster.webm", "noseek.mkv", "tailtags.mkv", "seek_no_tags.mkv"] {
         let p = env.copy(name, &format!("t_{name}"));
         let r = apply(&p, &[ch("Matroska", "Artist", Some("作者 A")), ch("Info", "Title", Some("題"))], false, false).unwrap();
         assert!(r.ok && r.updated, "{name}: {:?}", r.errors);

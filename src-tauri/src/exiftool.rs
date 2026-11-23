@@ -3,8 +3,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -16,6 +16,10 @@ const EXIFTOOL_VERSION: &str = include_str!("../vendor/exiftool.version");
 
 /// stderr の 1 コマンド分を待つ上限。大きな動画でもこれを超えることはまずない。
 const STDERR_TIMEOUT: Duration = Duration::from_secs(120);
+/// 読み取りなど通常のコマンドの応答を待つ上限。超えたら ExifTool が固まったとみなして止め、次の操作で起動し直す
+pub const READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// 書き込みの上限 (大きな動画はファイル全体を書き直すので長めにする)
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// 埋め込み zip を `base_dir/<version>-<hash>/` に展開し、exiftool.exe のパスを返す。
 /// 展開済み (完了マーカーあり) なら何もしない。
@@ -101,7 +105,7 @@ pub fn escape_value(v: &str) -> String {
 pub struct ExifTool {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout_rx: Receiver<String>,
     stderr_rx: Receiver<String>,
     seq: u64,
 }
@@ -127,25 +131,24 @@ impl ExifTool {
 
         let mut child = cmd.spawn().map_err(|e| format!("ExifTool を起動できません: {e}"))?;
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        // stderr は別スレッドで読み続ける (パイプが詰まって固まるのを防ぐ)
-        let (tx, stderr_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(Self { child, stdin, stdout, stderr_rx, seq: 0 })
+        // stdout / stderr は別スレッドで 1 行ずつ読む。待つ側で時間の上限を設けられるようにし、
+        // パイプが詰まって固まるのも防ぐ
+        Ok(Self { child, stdin, stdout_rx: read_lines(stdout), stderr_rx: read_lines(stderr), seq: 0 })
     }
 
-    /// 1 コマンドを実行し (stdout, stderr) を返す。
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// 1 コマンドを実行し (stdout, stderr) を返す。READ_TIMEOUT を超えたら ExifTool を止めてエラー
     pub fn execute(&mut self, args: &[&str]) -> Result<(String, String), String> {
+        self.execute_timeout(args, READ_TIMEOUT)
+    }
+
+    pub fn execute_timeout(&mut self, args: &[&str], timeout: Duration) -> Result<(String, String), String> {
         self.seq += 1;
         let n = self.seq;
         let err_marker = format!("{{ready-err{n}}}");
@@ -163,20 +166,23 @@ impl ExifTool {
             .map_err(|e| format!("ExifTool への送信に失敗: {e}"))?;
 
         let ready = format!("{{ready{n}}}");
+        let deadline = std::time::Instant::now() + timeout;
         let mut out = String::new();
         loop {
-            let mut line = String::new();
-            let read = self
-                .stdout
-                .read_line(&mut line)
-                .map_err(|e| format!("ExifTool の出力を読めません: {e}"))?;
-            if read == 0 {
-                return Err("ExifTool が終了しました".into());
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.stdout_rx.recv_timeout(left) {
+                Ok(line) if line.trim_end() == ready => break,
+                Ok(line) => {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // 固まった ExifTool は止める (with_exiftool が次の操作で起動し直す)
+                    let _ = self.child.kill();
+                    return Err(format!("ExifTool が {} 秒以内に応答しなかったため中断しました", timeout.as_secs()));
+                }
+                Err(RecvTimeoutError::Disconnected) => return Err("ExifTool が終了しました".into()),
             }
-            if line.trim_end() == ready {
-                break;
-            }
-            out.push_str(&line);
         }
 
         let mut err = String::new();
@@ -210,6 +216,49 @@ impl ExifTool {
     }
 }
 
+/// パイプを別スレッドで 1 行ずつ読み、チャネルへ送る (UTF-8 として読めないバイトは置き換える)
+fn read_lines(pipe: impl std::io::Read + Send + 'static) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    let line = line.trim_end_matches(['\n', '\r']).to_string();
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// プロセスを ID で強制終了する (終了時に ExifTool が処理中でロックを取れない場合に使う)
+#[cfg(windows)]
+pub fn kill_pid(pid: u32) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn TerminateProcess(handle: isize, code: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    // SAFETY: 取得したハンドルだけを使い、使い終わったら閉じる
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h != 0 {
+            TerminateProcess(h, 1);
+            CloseHandle(h);
+        }
+    }
+}
+
 impl Drop for ExifTool {
     fn drop(&mut self) {
         self.stop();
@@ -219,6 +268,22 @@ impl Drop for ExifTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 応答が上限時間を超えたら ExifTool を止めてエラーを返し、固まり続けない
+    #[test]
+    fn timeout_stops_exiftool() {
+        let base = std::env::temp_dir().join(format!("exif-app-test-to-{}", std::process::id()));
+        let mut et = ExifTool::start(&ensure_extracted(&base).unwrap()).unwrap();
+        let err = et.execute_timeout(&["-ver"], Duration::ZERO).unwrap_err();
+        assert!(err.contains("応答しなかった"), "{err}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!et.is_alive());
+        // 新しく起動すれば使える
+        let mut et = ExifTool::start(&ensure_extracted(&base).unwrap()).unwrap();
+        assert!(et.execute(&["-ver"]).is_ok());
+        drop(et);
+        let _ = fs::remove_dir_all(&base);
+    }
 
     /// 展開 → 起動 → 複数コマンド → 日本語パスの読み取り、を通しで確認する。
     /// EXIF_SAMPLE に日本語パスの画像を指定すると、その読み取りも確認する。

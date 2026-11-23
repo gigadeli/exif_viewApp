@@ -39,6 +39,11 @@ pub fn avi_info_is_utf8(path: &Path) -> bool {
     detect(path) == Some(Kind::Avi) && riff::info_is_utf8(path)
 }
 
+/// 古い文字コードの AVI の INFO を、PC の文字コードで読み直した値 (ExifTool のタグ名, 値)。AVI でなければ空
+pub fn avi_legacy_values(path: &Path) -> Vec<(&'static str, String)> {
+    if detect(path) == Some(Kind::Avi) { riff::legacy_values(path) } else { Vec::new() }
+}
+
 /// フロントエンドに渡す「自作ライターで書けるもの」
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

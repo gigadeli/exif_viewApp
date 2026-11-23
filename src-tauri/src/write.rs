@@ -129,7 +129,8 @@ fn apply(
     args.push(path.to_string());
 
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (out, err) = et.execute(&refs)?;
+    // 大きな動画はファイル全体を書き直すので、待つ上限を長くする
+    let (out, err) = et.execute_timeout(&refs, crate::exiftool::WRITE_TIMEOUT)?;
 
     let mut result = WriteResult { path: path.to_string(), ..Default::default() };
     for line in err.lines().map(str::trim).filter(|l| !l.is_empty()) {

@@ -893,8 +893,12 @@ pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result
         for (id, bytes, old) in appended {
             let new_rel = p - st.seg_data;
             match old {
+                // 移した要素は、古い項目を消して SeekHead の最後に新しく足す。
+                // 元の SeekHead にその要素の項目が無くても見つけられ、ExifTool (同じ種類の項目は最後のものを使う)
+                // も移した方を読む
                 Some(o) if *o != new_rel => {
-                    map.insert(*o, Some(new_rel));
+                    map.insert(*o, None);
+                    added.push((*id, new_rel));
                 }
                 Some(_) => {}
                 None => added.push((*id, new_rel)),
@@ -945,12 +949,7 @@ pub fn write(src: &Path, dst: &Path, edits: &[Edit], remove_all: bool) -> Result
             for e in tail.iter().filter(|e| e.id == CUES) {
                 entries.push((CUES, rel(e.off)));
             }
-            // 末尾へ移した要素 (新しい位置は m で決まる)
-            for (id, _, old) in &appended {
-                if let Some(o) = old {
-                    entries.push((*id, *o));
-                }
-            }
+            // 末尾へ移した要素は a (追加する項目) に入っている
             let mut body = Vec::new();
             for (id, pos) in entries {
                 body.extend(seek_entry(id, pos));
@@ -1242,6 +1241,42 @@ mod tests {
             let st = parse(&mut f).unwrap();
             let info = st.els.iter().find(|el| el.id == INFO).unwrap();
             assert_eq!(read_body(&mut f, info).unwrap(), retained);
+        });
+    }
+
+    /// SeekHead に Tags の項目が無いファイルで Tags を末尾へ移しても、SeekHead から見つかる
+    #[test]
+    fn moved_tags_are_listed_in_seekhead() {
+        let info = element(INFO, &element(TITLE, b"t"));
+        // SeekHead は Info だけを指す (位置は SeekHead の直後)
+        let seek_for = |pos: u64| element(SEEKHEAD, &seek_entry(INFO, pos));
+        let pos = seek_for(0).len() as u64;
+        let tags = element(TAGS, &new_global_tag(&new_simple("ARTIST", "a")));
+        let original = fixture(&[seek_for(pos), info, tags, element(CLUSTER, &[0; 16])]);
+        super::super::with_fixture("mkv", &original, |path| {
+            let long = "x".repeat(4000);
+            let result = change(path, "Matroska", "Comment", Some(&long));
+            assert!(result.updated, "{:?}", result.errors);
+            positions_valid(path).unwrap();
+            let els = dump(path);
+            let tags_pos = els.iter().find(|e| e.0 == TAGS).map(|e| e.1).unwrap();
+            assert!(tags_pos > els.iter().find(|e| e.0 == CLUSTER).unwrap().1, "Tags が末尾へ移っていない");
+            // SeekHead の最後の Tags の項目が移した Tags を指す
+            let mut f = File::open(path).unwrap();
+            let st = parse(&mut f).unwrap();
+            let sh = st.els.iter().find(|e| e.id == SEEKHEAD).unwrap();
+            let body = read_body(&mut f, sh).unwrap();
+            let last_tags = children(&body)
+                .unwrap()
+                .iter()
+                .filter_map(|s| {
+                    let kids = children(s.body).ok()?;
+                    let id = uint(kids.iter().find(|k| k.id == SEEK_ID)?.body) as u32;
+                    let pos = uint(kids.iter().find(|k| k.id == SEEK_POSITION)?.body);
+                    (id == TAGS).then_some(pos)
+                })
+                .last();
+            assert_eq!(last_tags, Some(tags_pos));
         });
     }
 

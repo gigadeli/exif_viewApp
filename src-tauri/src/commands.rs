@@ -11,7 +11,8 @@ use crate::exiftool::{self, ExifTool};
 
 /// ExifTool プロセスは 1 つだけ。初回のコマンド実行時に展開・起動する。
 #[derive(Default, Clone)]
-pub struct ExifToolState(pub Arc<Mutex<Option<ExifTool>>>);
+/// 2 つ目は起動中の ExifTool のプロセス ID (終了時、処理中でロックを取れなくても止められるように)
+pub struct ExifToolState(pub Arc<Mutex<Option<ExifTool>>>, pub Arc<std::sync::atomic::AtomicU32>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,7 +54,9 @@ pub(crate) fn with_exiftool<T>(
             .join("exiftool");
         std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
         let exe = exiftool::ensure_extracted(&base)?;
-        *guard = Some(ExifTool::start(&exe)?);
+        let et = ExifTool::start(&exe)?;
+        state.1.store(et.pid(), std::sync::atomic::Ordering::SeqCst);
+        *guard = Some(et);
     }
     f(guard.as_mut().unwrap())
 }
@@ -92,20 +95,12 @@ fn read_one(et: &mut ExifTool, path: &str) -> FileMetadata {
         warnings: Vec::new(),
     };
 
-    // -G1: 詳細なグループ名 / -a: 重複タグも出す / -s: タグ名で出力 / -j: JSON
-    let mut args = vec!["-j", "-G1", "-a", "-s", "-api", "LargeFileSupport=1"];
-    // AVI の INFO は既定では Latin-1 として読まれる。値が UTF-8 なら UTF-8 として読む
-    if crate::native::avi_info_is_utf8(Path::new(path)) {
-        args.extend(["-api", "CharsetRIFF=UTF8"]);
-    }
-    args.push(path);
-    let result = et.execute(&args);
-    match result {
-        Ok((out, err)) => {
+    match read_json(et, path) {
+        Ok((obj, err)) => {
             meta.warnings = err.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
-            match serde_json::from_str::<Vec<serde_json::Map<String, Value>>>(&out) {
-                Ok(list) if !list.is_empty() => meta.tags = parse_tags(&list[0]),
-                _ => {
+            match obj {
+                Some(obj) => meta.tags = parse_tags(&obj),
+                None => {
                     meta.error = Some(if err.trim().is_empty() {
                         "メタデータを読み取れませんでした".into()
                     } else {
@@ -117,6 +112,62 @@ fn read_one(et: &mut ExifTool, path: &str) -> FileMetadata {
         Err(e) => meta.error = Some(e),
     }
     meta
+}
+
+/// 1 ファイルのタグを ExifTool の JSON (グループ付きのキー) で読む。画面表示と書き出しで共通。
+/// AVI の INFO の文字コードはここで補正する。返り値は (タグ, ExifTool のエラー出力)
+fn read_json(et: &mut ExifTool, path: &str) -> Result<(Option<serde_json::Map<String, Value>>, String), String> {
+    // -G1: 詳細なグループ名 / -a: 重複タグも出す / -s: タグ名で出力 / -j: JSON
+    let mut args = vec!["-j", "-G1", "-a", "-s", "-api", "LargeFileSupport=1"];
+    // AVI の INFO は既定では Windows-1252 として読まれる。値が UTF-8 なら UTF-8 として読む
+    if crate::native::avi_info_is_utf8(Path::new(path)) {
+        args.extend(["-api", "CharsetRIFF=UTF8"]);
+    }
+    args.push(path);
+    let (out, err) = et.execute(&args)?;
+    let mut obj = serde_json::from_str::<Vec<serde_json::Map<String, Value>>>(&out)
+        .ok()
+        .and_then(|list| list.into_iter().next());
+    // 古い AVI の日本語などは ExifTool では読めないので、PC の文字コードで読み直した値に置き換える
+    if let Some(obj) = obj.as_mut() {
+        for (name, value) in crate::native::avi_legacy_values(Path::new(path)) {
+            if let Some(v) = obj.get_mut(&format!("RIFF:{name}")) {
+                *v = Value::String(value);
+            }
+        }
+    }
+    Ok((obj, err))
+}
+
+/// CSV の 1 マス。表計算ソフトで数式として実行されないよう、= + - @ などで始まる値 (数値を除く) は先頭に ' を付ける
+fn csv_cell(v: &str) -> String {
+    let formula = v.starts_with(['=', '+', '-', '@', '\t', '\r']) && v.trim().parse::<f64>().is_err();
+    let v = if formula { format!("'{v}") } else { v.to_string() };
+    if v.contains([',', '"', '\n', '\r']) || v.starts_with(' ') || v.ends_with(' ') {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v
+    }
+}
+
+/// 読み取った結果を CSV にする (1 行 = 1 ファイル、列 = タグ。ExifTool の -csv と同じ並び)
+fn to_csv(rows: &[serde_json::Map<String, Value>]) -> String {
+    let mut columns: Vec<&str> = vec!["SourceFile"];
+    for row in rows {
+        for k in row.keys() {
+            if !columns.contains(&k.as_str()) {
+                columns.push(k);
+            }
+        }
+    }
+    let mut out = columns.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(",");
+    out.push_str("\r\n");
+    for row in rows {
+        let line: Vec<String> = columns.iter().map(|c| row.get(*c).map(|v| csv_cell(&value_to_string(v))).unwrap_or_default()).collect();
+        out.push_str(&line.join(","));
+        out.push_str("\r\n");
+    }
+    out
 }
 
 #[tauri::command]
@@ -200,24 +251,22 @@ pub async fn export_metadata(
 ) -> Result<(), String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let fmt = match format.as_str() {
-            "json" => "-j",
-            "csv" => "-csv",
-            _ => return Err(format!("未対応の形式: {format}")),
-        };
-        let out = with_exiftool(&app, &state, |et| {
-            let mut args = vec![fmt, "-G1", "-a", "-s", "-api", "LargeFileSupport=1"];
-            args.extend(paths.iter().map(String::as_str));
-            let (out, err) = et.execute(&args)?;
-            if out.trim().is_empty() {
-                return Err(if err.trim().is_empty() { "出力が空です".into() } else { err });
+        if format != "json" && format != "csv" {
+            return Err(format!("未対応の形式: {format}"));
+        }
+        // 画面と同じ読み方 (AVI の文字コードの補正を含む) で 1 ファイルずつ読む
+        let rows = with_exiftool(&app, &state, |et| {
+            let mut rows = Vec::new();
+            for p in &paths {
+                let (obj, err) = read_json(et, p)?;
+                rows.push(obj.ok_or_else(|| if err.trim().is_empty() { format!("読み取れませんでした: {p}") } else { err })?);
             }
-            Ok(out)
+            Ok(rows)
         })?;
-        let bytes = if fmt == "-csv" {
-            [b"\xEF\xBB\xBF".as_slice(), out.as_bytes()].concat()
+        let bytes = if format == "csv" {
+            [b"\xEF\xBB\xBF".as_slice(), to_csv(&rows).as_bytes()].concat()
         } else {
-            out.into_bytes()
+            serde_json::to_vec_pretty(&rows).map_err(|e| e.to_string())?
         };
         std::fs::write(&dest, bytes).map_err(|e| format!("書き出せませんでした: {e}"))
     })
@@ -234,9 +283,42 @@ pub fn startup_paths() -> Vec<String> {
         .collect()
 }
 
-/// 終了時に ExifTool を止める
+/// 終了時に ExifTool を止める。処理中 (ロックを取れない) なら待たずにプロセスを強制終了する
 pub fn shutdown(state: &ExifToolState) {
-    if let Ok(mut guard) = state.0.lock() {
-        guard.take();
+    match state.0.try_lock() {
+        Ok(mut guard) => {
+            guard.take();
+        }
+        Err(_) => {
+            let pid = state.1.load(std::sync::atomic::Ordering::SeqCst);
+            #[cfg(windows)]
+            if pid != 0 {
+                crate::exiftool::kill_pid(pid);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_cells_are_safe() {
+        assert_eq!(csv_cell("plain"), "plain");
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_cell("=HYPERLINK(\"x\")"), "\"'=HYPERLINK(\"\"x\"\")\"");
+        assert_eq!(csv_cell("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(csv_cell("-12.5"), "-12.5");
+        assert_eq!(csv_cell("+cmd"), "'+cmd");
+        assert_eq!(csv_cell("1 行目\n2 行目"), "\"1 行目\n2 行目\"");
+    }
+
+    #[test]
+    fn csv_has_one_row_per_file() {
+        let row = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect();
+        let csv = to_csv(&[row(&[("SourceFile", "a.jpg"), ("IFD0:Make", "X")]), row(&[("SourceFile", "b.avi"), ("RIFF:Title", "題")])]);
+        assert_eq!(csv, "SourceFile,IFD0:Make,RIFF:Title\r\na.jpg,X,\r\nb.avi,,題\r\n");
     }
 }

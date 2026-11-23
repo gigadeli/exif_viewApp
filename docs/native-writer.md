@@ -77,8 +77,12 @@ ExifTool の表示名（グループ `RIFF`）と INFO の ID:
 | ArchivalLocation | IARL | Commissioned | ICMS |
 
 - 日付（ICRD）は `YYYY-MM-DD HH:MM:SS` で書く（ExifTool は `-` を `:` に変えて表示する）。
-- **文字コード**: 値は UTF-8 で書く（ffmpeg など今のツールと同じ）。ExifTool は RIFF の文字列を既定で Latin-1 として読むので、読み取り時に INFO の値がすべて正しい UTF-8 なら `-api CharsetRIFF=UTF8` を付けて読む。正しい UTF-8 でない古いファイルは今までどおり読む。
-- 古い AVI の INFO を変更するときは、既存値を ExifTool の Latin（Windows-1252）と同じ対応表で UTF-8 に変換する。値が変わらない保存では元のバイト列を保持する。
+- **文字コード**: 値は UTF-8 で書く（ffmpeg など今のツールと同じ）。ExifTool は RIFF の文字列を既定で Windows-1252 として読むので、INFO の値がすべて正しい UTF-8 なら `-api CharsetRIFF=UTF8` を付けて読む。
+- **古い AVI（UTF-8 でない INFO）**: 古いソフトはシステムの文字コード（日本語の Windows なら CP932）で書いている。
+  ExifTool は CP932 を読めないため、値は PC の ANSI コードページで読み直す（Windows の `MultiByteToWideChar`。
+  そのコードページとして正しくないバイト列なら Windows-1252）。画面表示・書き出し・保存のすべてで同じ読み方をする。
+  - 保存時は、保持する既存値もこの読み方で UTF-8 に直してから書く（新しい値と文字コードを揃えるため）。見えていた文字のまま残るが、元のバイト列は残らない（バックアップには残る）。
+  - 値が変わらない保存では書き込まないので、元のバイト列のまま。
 - `hdrl` 内の `IDIT`（DateTimeOriginal）など、INFO 以外のタグは書き込み対象外（読み取り専用）。
 
 ## 4. MKV / WebM（Matroska）
@@ -129,7 +133,7 @@ Segment <size（不明もあり）>
 
 次の順に試し、どれもできなければ**何も変えずにエラー**にする。
 
-1. **Tags を末尾へ移す**: 変更した Tags（新しく作った Tags も含む）をヘッダー領域から取り除き、Segment の末尾に置く。SeekHead にはその位置を書く（ExifTool やプレーヤーは SeekHead から見つける）。
+1. **Tags を末尾へ移す**: 変更した Tags（新しく作った Tags も含む）をヘッダー領域から取り除き、Segment の末尾に置く。SeekHead からは古い項目を消し、**最後に新しい項目を足す**（ExifTool やプレーヤーは SeekHead から見つける。元の SeekHead に Tags の項目が無いファイルでも見つかり、同じ種類の項目は最後のものを使う ExifTool も移した方を読む）。
    - Segment がファイルの最後で終わっている場合だけ行う。Segment のサイズが決まっていればサイズ欄を書き直す（サイズ欄の長さは変えない）。サイズが「不明」ならそのまま。
    - ヘッダー領域に SeekHead が無い場合は、新しく作ってヘッダー領域の先頭に置く。
 2. **ヘッダー領域を広げる**（実装中に追加。長いタイトルなどで Info が大きくなった場合に必要）: 足りない分に 4KB の余白を足した `Δ` バイトだけヘッダー領域を広げ、ファイルを書き直す。Cluster 以降はすべて `Δ` だけ後ろへずれるので、次を直す。
@@ -186,6 +190,7 @@ Segment <size（不明もあり）>
   | unknown_cluster.webm | Cluster のサイズも不明（ライブ配信の形） |
   | noseek.mkv | SeekHead なし |
   | tailtags.mkv | Tags が Cues より後ろ（ファイルの最後） |
+  | seek_no_tags.mkv | SeekHead はあるが Tags の項目が無い |
 - 1GB を超える AVI（OpenDML の索引と AVIX を持つ）は大きいので別に作る:
   `ffmpeg -f lavfi -i testsrc=size=640x480:rate=25 -f lavfi -i sine -t 100 -c:v rawvideo -pix_fmt yuv420p -c:a pcm_s16le odml.avi`
 - 実行: `EXIF_NATIVE_DIR=<フォルダ>`（と `EXIF_NATIVE_BIG=<odml.avi>`）を設定して `cargo test --lib native`。
@@ -201,6 +206,18 @@ Segment <size（不明もあり）>
   - バックアップ（`_original` は元ファイルと同じ内容）、更新日時を変えない設定、作業用ファイルが残らない
 
 ## 8. 結果と制限
+
+### 敵対的レビューでの修正（2026-11-23）
+
+| 問題 | 修正 |
+|---|---|
+| SeekHead に Tags の項目が無い MKV で Tags を末尾へ移すと、保存は成功するのに既存のタグも読めなくなる | 移した要素は SeekHead の最後に項目を足す（テスト: `moved_tags_are_listed_in_seekhead`、実ファイル `seek_no_tags.mkv`） |
+| CP932 の古い AVI を保存すると、触っていない値が Windows-1252 の文字化けのまま UTF-8 で固定される | PC の ANSI コードページで読み直す。表示も同じ読み方にする（`legacy_cp932_is_kept_readable`） |
+| JSON / CSV の書き出しで AVI の日本語が文字化けする | 書き出しも画面と同じ読み取り処理（`read_json`）を 1 ファイルずつ使い、JSON / CSV はアプリで組み立てる |
+| CSV の値が表計算ソフトで数式として実行され得る | `= + - @` などで始まる値（数値を除く）の先頭に `'` を付ける |
+| ExifTool が応答しないとアプリが固まり、閉じられない | 応答の上限（読み取り 5 分、書き込み 60 分）を超えたら ExifTool を止め、次の操作で起動し直す。終了時は処理中でも待たずに止める |
+| AVI で書き込めない IDIT の日時だけがあるとき、「×」を押しても何も変わらない | その場合は「×」を無効にして理由を表示する |
+
 
 - 上の確認はすべて合格（2026-11-23）。exe のサイズは 15.5MB → 15.6MB。
 - 画面（よく使う項目・タグ表）は、モックの API を使ってブラウザで表示し、AVI / MKV で書き込めるタグだけが編集でき、

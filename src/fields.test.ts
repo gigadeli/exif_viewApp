@@ -8,7 +8,7 @@ import {
   TZ_OPTIONS,
   utcToLocal,
 } from "./dates";
-import { mediaKind, readDate, readTextField, setDate, setTextField } from "./fields";
+import { dateClearable, mediaKind, readDate, readTextField, setDate, setTextField } from "./fields";
 import type { FileEdits, FileMetadata } from "./types";
 
 const file = (tags: [string, string][]): FileMetadata => ({
@@ -224,5 +224,17 @@ describe("AVI / MKV / WebM fields", () => {
     expect(changes).toEqual([{ group: "Info", name: "DateTimeOriginal", value: "2026:11:01 01:20:30Z" }]);
     const read = readDate(mkv, none, "matroska");
     expect(localToUtc(read.dt!, read.tz)).toEqual(dt("2024:05:01 01:20:30"));
+  });
+});
+
+describe("AVI date clearing", () => {
+  const none: FileEdits = {};
+  it("cannot clear a date that only exists in the read-only IDIT", () => {
+    const idit = file([["File:FileType", "AVI"], ["RIFF:DateTimeOriginal", "2024:05:01 10:20:30"]]);
+    expect(readDate(idit, none, "avi").dt).not.toBeNull();
+    expect(dateClearable(idit, none, "avi")).toBe(false);
+    const created = file([["File:FileType", "AVI"], ["RIFF:DateCreated", "2024:05:01 10:20:30"]]);
+    expect(dateClearable(created, none, "avi")).toBe(true);
+    expect(setDate(created, none, "avi", null, "")).toEqual([{ group: "RIFF", name: "DateCreated", value: null }]);
   });
 });

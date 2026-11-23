@@ -3,6 +3,7 @@ import { fromInputValue, toInputValue, TZ_OPTIONS, type TzOffset } from "../date
 import { isFileWritable } from "../editing";
 import {
   dateFieldKeys,
+  dateClearable,
   dateHasTz,
   findByName,
   INFO_TAGS,
@@ -73,6 +74,7 @@ export function QuickEdit({ file, edits, writable, onApply, onRevertKeys, onShow
           value={readDate(file, edits, kind)}
           allowNoTz={kind === "image"}
           showTz={dateHasTz(kind)}
+          clearable={dateClearable(file, edits, kind)}
           disabled={disabled}
           onCommit={(dt, tz) => onApply(setDate(file, edits, kind, dt, tz))}
         />
@@ -197,12 +199,15 @@ function DateInput({
   value,
   allowNoTz,
   showTz,
+  clearable,
   disabled,
   onCommit,
 }: {
   value: ReturnType<typeof readDate>;
   allowNoTz: boolean;
   showTz: boolean;
+  /** 表示中の日時を消せるか (AVI の書き込めない IDIT だけのときは消せない) */
+  clearable: boolean;
   disabled: boolean;
   onCommit: (dt: ReturnType<typeof fromInputValue>, tz: TzOffset) => void;
 }) {
@@ -212,6 +217,7 @@ function DateInput({
 
   const commitDate = () => {
     if (draft === current) return;
+    if (draft === "" && !clearable) return setDraft(current);
     const dt = fromInputValue(draft);
     if (dt || draft === "") onCommit(dt, value.tz);
   };
@@ -246,9 +252,9 @@ function DateInput({
       )}
       <button
         className="icon-btn visible"
-        title={S.fClearDate}
+        title={value.dt && !clearable ? S.fClearDateReadOnly : S.fClearDate}
         aria-label={S.fClearDate}
-        disabled={disabled || !value.dt}
+        disabled={disabled || !clearable}
         onClick={() => onCommit(null, value.tz)}
       >
         ×
